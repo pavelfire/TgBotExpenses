@@ -10,29 +10,50 @@
 - есть статистика за сегодня, 7 дней и 30 дней.
 
 ## 1) Что нужно
-- Go 1.22+
-- PostgreSQL
+- Docker + Docker Compose plugin на сервере
+- SSH-доступ к серверу
 - Токен Telegram-бота от [@BotFather](https://t.me/BotFather)
 
-## 2) Настройка
-Скопируй `.env.example` в `.env` и заполни:
+## 2) One-command deploy через SSH
+На своей локальной машине (в этой папке) выполни:
 
 ```bash
-cp .env.example .env
+chmod +x deploy.sh
+./deploy.sh user@your-server-ip /opt/tg-expenses-bot
 ```
 
-Поля:
-- `BOT_TOKEN` — токен бота
-- `DATABASE_URL` — строка подключения к PostgreSQL
+Скрипт:
+- копирует проект на сервер;
+- создает `.env` из `.env.docker.example`, если его нет;
+- запускает `docker compose up -d --build`.
 
-## 3) Запуск
+После первого деплоя на сервере отредактируй:
+- `/opt/tg-expenses-bot/.env`
 
 ```bash
-go mod tidy
-go run .
+BOT_TOKEN=...
+POSTGRES_DB=tg_expenses
+POSTGRES_USER=tg_user
+POSTGRES_PASSWORD=...
 ```
 
-При первом запуске таблицы создаются автоматически.
+И перезапусти:
+
+```bash
+ssh user@your-server-ip "cd /opt/tg-expenses-bot && docker compose up -d --build"
+```
+
+## 3) Логи и обновления
+
+Логи:
+```bash
+ssh user@your-server-ip "cd /opt/tg-expenses-bot && docker compose logs -f bot"
+```
+
+Повторный деплой после изменений:
+```bash
+./deploy.sh user@your-server-ip /opt/tg-expenses-bot
+```
 
 ## 4) Как пользоваться
 1. Напиши боту `/start`
