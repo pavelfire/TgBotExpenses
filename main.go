@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"log"
@@ -229,6 +231,9 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 		delete(states, tgUserID)
 		states[tgUserID] = userState{Action: actionWaitCustomTitle}
 		sendText(bot, chatID, "Введи название новой категории:")
+	case data == "menu_export":
+		delete(states, tgUserID)
+		sendExportPeriodKeyboard(bot, chatID)
 	case data == "menu_last":
 		delete(states, tgUserID)
 		if err := sendLastExpenseKeyboard(bot, db, chatID, userID); err != nil {
@@ -254,6 +259,18 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 			return
 		}
 		sendMainMenu(bot, chatID, text)
+	case strings.HasPrefix(data, "export:"):
+		period := strings.TrimPrefix(data, "export:")
+		filename, content, err := buildCSVReport(db, userID, period)
+		if err != nil {
+			sendText(bot, chatID, "Не удалось сформировать CSV отчет.")
+			return
+		}
+		if err := sendCSVDocument(bot, chatID, filename, content); err != nil {
+			sendText(bot, chatID, "Не удалось отправить CSV файл.")
+			return
+		}
+		sendMainMenu(bot, chatID, "CSV отчет отправлен.")
 	case strings.HasPrefix(data, "last_delete:"):
 		idStr := strings.TrimPrefix(data, "last_delete:")
 		expenseID, err := strconv.ParseInt(idStr, 10, 64)
@@ -465,6 +482,93 @@ ORDER BY total DESC
 	return strings.Join(lines, "\n"), nil
 }
 
+func periodFrom(period string) (time.Time, string, string, error) {
+	now := time.Now()
+	switch period {
+	case "today":
+		y, m, d := now.Date()
+		from := time.Date(y, m, d, 0, 0, 0, 0, now.Location())
+		return from, "за сегодня", "today", nil
+	case "week":
+		return now.AddDate(0, 0, -7), "за 7 дней", "week", nil
+	case "month":
+		return now.AddDate(0, -1, 0), "за 30 дней", "month", nil
+	default:
+		return time.Time{}, "", "", errors.New("unknown period")
+	}
+}
+
+func buildCSVReport(db *sql.DB, userID int64, period string) (string, []byte, error) {
+	from, label, slug, err := periodFrom(period)
+	if err != nil {
+		return "", nil, err
+	}
+
+	rows, err := db.Query(`
+SELECT e.id, c.name, e.amount, e.created_at
+FROM expenses e
+JOIN categories c ON c.id = e.category_id
+WHERE e.user_id = $1 AND e.created_at >= $2
+ORDER BY e.created_at DESC, e.id DESC
+`, userID, from)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+
+	buf := &bytes.Buffer{}
+	writer := csv.NewWriter(buf)
+	if err := writer.Write([]string{"expense_id", "category", "amount", "created_at"}); err != nil {
+		return "", nil, err
+	}
+
+	total := 0.0
+	count := 0
+	for rows.Next() {
+		var id int64
+		var category string
+		var amount float64
+		var createdAt time.Time
+		if err := rows.Scan(&id, &category, &amount, &createdAt); err != nil {
+			return "", nil, err
+		}
+		count++
+		total += amount
+		if err := writer.Write([]string{
+			strconv.FormatInt(id, 10),
+			category,
+			fmt.Sprintf("%.2f", amount),
+			createdAt.Format(time.RFC3339),
+		}); err != nil {
+			return "", nil, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", nil, err
+	}
+
+	if err := writer.Write([]string{}); err != nil {
+		return "", nil, err
+	}
+	if err := writer.Write([]string{"period", label}); err != nil {
+		return "", nil, err
+	}
+	if err := writer.Write([]string{"records", strconv.Itoa(count)}); err != nil {
+		return "", nil, err
+	}
+	if err := writer.Write([]string{"total", fmt.Sprintf("%.2f", total)}); err != nil {
+		return "", nil, err
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return "", nil, err
+	}
+
+	filename := fmt.Sprintf("expenses_%s_%s.csv", slug, time.Now().Format("20060102_150405"))
+	return filename, buf.Bytes(), nil
+}
+
 func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64, text string) {
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -479,8 +583,29 @@ func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64, text string) {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🧾 Последний расход", "menu_last"),
 		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📤 Экспорт CSV", "menu_export"),
+		),
 	)
 	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = kb
+	_, _ = bot.Send(msg)
+}
+
+func sendExportPeriodKeyboard(bot *tgbotapi.BotAPI, chatID int64) {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Сегодня", "export:today"),
+			tgbotapi.NewInlineKeyboardButtonData("7 дней", "export:week"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("30 дней", "export:month"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "menu_back"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, "Выбери период для CSV отчета:")
 	msg.ReplyMarkup = kb
 	_, _ = bot.Send(msg)
 }
@@ -554,6 +679,15 @@ func sendStatsPeriodKeyboard(bot *tgbotapi.BotAPI, chatID int64) {
 func sendText(bot *tgbotapi.BotAPI, chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	_, _ = bot.Send(msg)
+}
+
+func sendCSVDocument(bot *tgbotapi.BotAPI, chatID int64, filename string, content []byte) error {
+	doc := tgbotapi.NewDocument(chatID, tgbotapi.FileBytes{
+		Name:  filename,
+		Bytes: content,
+	})
+	_, err := bot.Send(doc)
+	return err
 }
 
 func answerCallback(bot *tgbotapi.BotAPI, callbackID, text string) {
