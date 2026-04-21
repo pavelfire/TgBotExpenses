@@ -34,12 +34,14 @@ type userState struct {
 	Action     string
 	CategoryID int64
 	ExpenseID  int64
+	Amount     float64
 }
 
 const (
 	actionWaitAmount      = "wait_amount"
 	actionWaitCustomTitle = "wait_custom_title"
 	actionWaitEditAmount  = "wait_edit_amount"
+	actionWaitNote        = "wait_note"
 )
 
 func main() {
@@ -178,12 +180,31 @@ func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState,
 			sendText(bot, chatID, "Введи сумму числом, например: 350.50")
 			return
 		}
-		if err := addExpense(db, userID, state.CategoryID, amount); err != nil {
+		states[tgUserID] = userState{
+			Action:     actionWaitNote,
+			CategoryID: state.CategoryID,
+			Amount:     amount,
+		}
+		sendText(bot, chatID, "Теперь введи комментарий к расходу (например: \"кофе в центре\"). Можно отправить '-' чтобы пропустить.")
+	case actionWaitNote:
+		note := strings.TrimSpace(msg.Text)
+		if note == "-" {
+			note = ""
+		}
+		if len([]rune(note)) > 120 {
+			sendText(bot, chatID, "Комментарий слишком длинный. До 120 символов.")
+			return
+		}
+		if err := addExpense(db, userID, state.CategoryID, state.Amount, note); err != nil {
 			sendText(bot, chatID, "Не удалось сохранить расход.")
 			return
 		}
 		delete(states, tgUserID)
-		sendMainMenu(bot, chatID, fmt.Sprintf("Сохранено: %.2f", amount))
+		if note == "" {
+			sendMainMenu(bot, chatID, fmt.Sprintf("Сохранено: %.2f", state.Amount))
+			return
+		}
+		sendMainMenu(bot, chatID, fmt.Sprintf("Сохранено: %.2f\nКомментарий: %s", state.Amount, note))
 	case actionWaitEditAmount:
 		amountText := strings.ReplaceAll(strings.TrimSpace(msg.Text), ",", ".")
 		amount, err := strconv.ParseFloat(amountText, 64)
@@ -359,7 +380,7 @@ func categoriesByUser(db *sql.DB, userID int64) ([]struct {
 	return out, rows.Err()
 }
 
-func addExpense(db *sql.DB, userID, categoryID int64, amount float64) error {
+func addExpense(db *sql.DB, userID, categoryID int64, amount float64, note string) error {
 	var exists bool
 	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM categories WHERE id = $1 AND user_id = $2)`, categoryID, userID).Scan(&exists)
 	if err != nil {
@@ -370,30 +391,31 @@ func addExpense(db *sql.DB, userID, categoryID int64, amount float64) error {
 	}
 
 	_, err = db.Exec(`
-INSERT INTO expenses(user_id, category_id, amount) VALUES($1, $2, $3)
-`, userID, categoryID, amount)
+INSERT INTO expenses(user_id, category_id, amount, note) VALUES($1, $2, $3, $4)
+`, userID, categoryID, amount, note)
 	return err
 }
 
-func getLastExpense(db *sql.DB, userID int64) (int64, string, float64, time.Time, error) {
+func getLastExpense(db *sql.DB, userID int64) (int64, string, float64, string, time.Time, error) {
 	var (
 		id        int64
 		category  string
 		amount    float64
+		note      string
 		createdAt time.Time
 	)
 	err := db.QueryRow(`
-SELECT e.id, c.name, e.amount, e.created_at
+SELECT e.id, c.name, e.amount, e.note, e.created_at
 FROM expenses e
 JOIN categories c ON c.id = e.category_id
 WHERE e.user_id = $1
 ORDER BY e.created_at DESC, e.id DESC
 LIMIT 1
-`, userID).Scan(&id, &category, &amount, &createdAt)
+`, userID).Scan(&id, &category, &amount, &note, &createdAt)
 	if err != nil {
-		return 0, "", 0, time.Time{}, err
+		return 0, "", 0, "", time.Time{}, err
 	}
-	return id, category, amount, createdAt, nil
+	return id, category, amount, note, createdAt, nil
 }
 
 func deleteExpenseByID(db *sql.DB, userID, expenseID int64) error {
@@ -505,7 +527,7 @@ func buildCSVReport(db *sql.DB, userID int64, period string) (string, []byte, er
 	}
 
 	rows, err := db.Query(`
-SELECT e.id, c.name, e.amount, e.created_at
+SELECT e.id, c.name, e.amount, e.note, e.created_at
 FROM expenses e
 JOIN categories c ON c.id = e.category_id
 WHERE e.user_id = $1 AND e.created_at >= $2
@@ -518,7 +540,7 @@ ORDER BY e.created_at DESC, e.id DESC
 
 	buf := &bytes.Buffer{}
 	writer := csv.NewWriter(buf)
-	if err := writer.Write([]string{"expense_id", "category", "amount", "created_at"}); err != nil {
+	if err := writer.Write([]string{"expense_id", "category", "amount", "note", "created_at"}); err != nil {
 		return "", nil, err
 	}
 
@@ -528,8 +550,9 @@ ORDER BY e.created_at DESC, e.id DESC
 		var id int64
 		var category string
 		var amount float64
+		var note string
 		var createdAt time.Time
-		if err := rows.Scan(&id, &category, &amount, &createdAt); err != nil {
+		if err := rows.Scan(&id, &category, &amount, &note, &createdAt); err != nil {
 			return "", nil, err
 		}
 		count++
@@ -538,6 +561,7 @@ ORDER BY e.created_at DESC, e.id DESC
 			strconv.FormatInt(id, 10),
 			category,
 			fmt.Sprintf("%.2f", amount),
+			note,
 			createdAt.Format(time.RFC3339),
 		}); err != nil {
 			return "", nil, err
@@ -611,7 +635,7 @@ func sendExportPeriodKeyboard(bot *tgbotapi.BotAPI, chatID int64) {
 }
 
 func sendLastExpenseKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID int64) error {
-	id, category, amount, createdAt, err := getLastExpense(db, userID)
+	id, category, amount, note, createdAt, err := getLastExpense(db, userID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			sendMainMenu(bot, chatID, "У тебя пока нет расходов.")
@@ -620,7 +644,11 @@ func sendLastExpenseKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID in
 		return err
 	}
 
-	text := fmt.Sprintf("Последний расход:\nКатегория: %s\nСумма: %.2f\nДата: %s", category, amount, createdAt.Format("02.01.2006 15:04"))
+	noteText := note
+	if noteText == "" {
+		noteText = "—"
+	}
+	text := fmt.Sprintf("Последний расход:\nКатегория: %s\nСумма: %.2f\nКомментарий: %s\nДата: %s", category, amount, noteText, createdAt.Format("02.01.2006 15:04"))
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("✏️ Изменить сумму", fmt.Sprintf("last_edit:%d", id)),
