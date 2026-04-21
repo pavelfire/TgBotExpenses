@@ -319,6 +319,29 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 			sendText(bot, chatID, "Не удалось получить статистику.")
 			return
 		}
+		sendStatsResultWithDetailsKeyboard(bot, chatID, text, period)
+	case strings.HasPrefix(data, "statsdetails:"):
+		period := strings.TrimPrefix(data, "statsdetails:")
+		sendStatsDepthKeyboard(bot, chatID, period)
+	case strings.HasPrefix(data, "statsdepth:"):
+		payload := strings.TrimPrefix(data, "statsdepth:")
+		parts := strings.SplitN(payload, ":", 2)
+		if len(parts) != 2 {
+			answerCallback(bot, cq.ID, "Неверный формат")
+			return
+		}
+		period := parts[0]
+		limitRaw := parts[1]
+		limit, err := parseStatsLimit(limitRaw)
+		if err != nil {
+			answerCallback(bot, cq.ID, "Неверный лимит")
+			return
+		}
+		text, err := buildDetailedStats(db, userID, period, limit)
+		if err != nil {
+			sendText(bot, chatID, "Не удалось получить развернутую статистику.")
+			return
+		}
 		sendMainMenu(bot, chatID, text)
 	case strings.HasPrefix(data, "export:"):
 		period := strings.TrimPrefix(data, "export:")
@@ -544,6 +567,76 @@ ORDER BY total DESC
 	return strings.Join(lines, "\n"), nil
 }
 
+func buildDetailedStats(db *sql.DB, userID int64, period string, limit int) (string, error) {
+	from, label, _, err := periodFrom(period)
+	if err != nil {
+		return "", err
+	}
+
+	query := `
+SELECT c.name, e.amount, e.note, e.created_at
+FROM expenses e
+JOIN categories c ON c.id = e.category_id
+WHERE e.user_id = $1 AND e.created_at >= $2
+ORDER BY e.created_at DESC, e.id DESC
+`
+	var rows *sql.Rows
+	if limit > 0 {
+		query += "LIMIT $3"
+		rows, err = db.Query(query, userID, from, limit)
+	} else {
+		rows, err = db.Query(query, userID, from)
+	}
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	title := fmt.Sprintf("Развернутая статистика %s (все записи):", label)
+	if limit > 0 {
+		title = fmt.Sprintf("Развернутая статистика %s (до %d записей):", label, limit)
+	}
+	lines := []string{title}
+	total := 0.0
+	count := 0
+	for rows.Next() {
+		var category string
+		var amount float64
+		var note string
+		var createdAt time.Time
+		if err := rows.Scan(&category, &amount, &note, &createdAt); err != nil {
+			return "", err
+		}
+		count++
+		total += amount
+		if note == "" {
+			note = "—"
+		}
+		lines = append(lines, fmt.Sprintf("%d) %s | %.2f | %s | %s", count, category, amount, note, createdAt.Format("02.01 15:04")))
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if count == 0 {
+		return fmt.Sprintf("Пока нет расходов %s.", label), nil
+	}
+	lines = append(lines, fmt.Sprintf("\nИтого: %.2f", total))
+	return strings.Join(lines, "\n"), nil
+}
+
+func parseStatsLimit(raw string) (int, error) {
+	switch raw {
+	case "30":
+		return 30, nil
+	case "100":
+		return 100, nil
+	case "all":
+		return 0, nil
+	default:
+		return 0, errors.New("unknown limit")
+	}
+}
+
 func periodFrom(period string) (time.Time, string, string, error) {
 	now := time.Now()
 	switch period {
@@ -761,6 +854,36 @@ func sendStatsPeriodKeyboard(bot *tgbotapi.BotAPI, chatID int64) {
 		),
 	)
 	msg := tgbotapi.NewMessage(chatID, "Выбери период:")
+	msg.ReplyMarkup = kb
+	_, _ = bot.Send(msg)
+}
+
+func sendStatsResultWithDetailsKeyboard(bot *tgbotapi.BotAPI, chatID int64, text, period string) {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔎 Развернутая с комментариями", fmt.Sprintf("statsdetails:%s", period)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "menu_back"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = kb
+	_, _ = bot.Send(msg)
+}
+
+func sendStatsDepthKeyboard(bot *tgbotapi.BotAPI, chatID int64, period string) {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("30", fmt.Sprintf("statsdepth:%s:30", period)),
+			tgbotapi.NewInlineKeyboardButtonData("100", fmt.Sprintf("statsdepth:%s:100", period)),
+			tgbotapi.NewInlineKeyboardButtonData("все", fmt.Sprintf("statsdepth:%s:all", period)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "menu_stats"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, "Выбери глубину развернутой статистики:")
 	msg.ReplyMarkup = kb
 	_, _ = bot.Send(msg)
 }
