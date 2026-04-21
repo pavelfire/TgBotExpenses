@@ -31,11 +31,13 @@ var defaultCategories = []string{
 type userState struct {
 	Action     string
 	CategoryID int64
+	ExpenseID  int64
 }
 
 const (
 	actionWaitAmount      = "wait_amount"
 	actionWaitCustomTitle = "wait_custom_title"
+	actionWaitEditAmount  = "wait_edit_amount"
 )
 
 func main() {
@@ -180,6 +182,19 @@ func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState,
 		}
 		delete(states, tgUserID)
 		sendMainMenu(bot, chatID, fmt.Sprintf("Сохранено: %.2f", amount))
+	case actionWaitEditAmount:
+		amountText := strings.ReplaceAll(strings.TrimSpace(msg.Text), ",", ".")
+		amount, err := strconv.ParseFloat(amountText, 64)
+		if err != nil || amount <= 0 {
+			sendText(bot, chatID, "Введи новую сумму числом, например: 350.50")
+			return
+		}
+		if err := updateExpenseAmount(db, userID, state.ExpenseID, amount); err != nil {
+			sendText(bot, chatID, "Не удалось обновить расход.")
+			return
+		}
+		delete(states, tgUserID)
+		sendMainMenu(bot, chatID, fmt.Sprintf("Последний расход обновлен: %.2f", amount))
 	default:
 		delete(states, tgUserID)
 		sendMainMenu(bot, chatID, "Состояние сброшено. Выбери действие.")
@@ -214,6 +229,11 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 		delete(states, tgUserID)
 		states[tgUserID] = userState{Action: actionWaitCustomTitle}
 		sendText(bot, chatID, "Введи название новой категории:")
+	case data == "menu_last":
+		delete(states, tgUserID)
+		if err := sendLastExpenseKeyboard(bot, db, chatID, userID); err != nil {
+			sendText(bot, chatID, "Не удалось загрузить последний расход.")
+		}
 	case data == "menu_back":
 		delete(states, tgUserID)
 		sendMainMenu(bot, chatID, "Главное меню")
@@ -234,6 +254,28 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 			return
 		}
 		sendMainMenu(bot, chatID, text)
+	case strings.HasPrefix(data, "last_delete:"):
+		idStr := strings.TrimPrefix(data, "last_delete:")
+		expenseID, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			answerCallback(bot, cq.ID, "Неверный расход")
+			return
+		}
+		if err := deleteExpenseByID(db, userID, expenseID); err != nil {
+			sendText(bot, chatID, "Не удалось удалить расход.")
+			return
+		}
+		delete(states, tgUserID)
+		sendMainMenu(bot, chatID, "Последний расход удален.")
+	case strings.HasPrefix(data, "last_edit:"):
+		idStr := strings.TrimPrefix(data, "last_edit:")
+		expenseID, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			answerCallback(bot, cq.ID, "Неверный расход")
+			return
+		}
+		states[tgUserID] = userState{Action: actionWaitEditAmount, ExpenseID: expenseID}
+		sendText(bot, chatID, "Введи новую сумму для последнего расхода:")
 	default:
 		answerCallback(bot, cq.ID, "Неизвестное действие")
 		return
@@ -316,6 +358,57 @@ INSERT INTO expenses(user_id, category_id, amount) VALUES($1, $2, $3)
 	return err
 }
 
+func getLastExpense(db *sql.DB, userID int64) (int64, string, float64, time.Time, error) {
+	var (
+		id        int64
+		category  string
+		amount    float64
+		createdAt time.Time
+	)
+	err := db.QueryRow(`
+SELECT e.id, c.name, e.amount, e.created_at
+FROM expenses e
+JOIN categories c ON c.id = e.category_id
+WHERE e.user_id = $1
+ORDER BY e.created_at DESC, e.id DESC
+LIMIT 1
+`, userID).Scan(&id, &category, &amount, &createdAt)
+	if err != nil {
+		return 0, "", 0, time.Time{}, err
+	}
+	return id, category, amount, createdAt, nil
+}
+
+func deleteExpenseByID(db *sql.DB, userID, expenseID int64) error {
+	res, err := db.Exec(`DELETE FROM expenses WHERE id = $1 AND user_id = $2`, expenseID, userID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errors.New("expense not found")
+	}
+	return nil
+}
+
+func updateExpenseAmount(db *sql.DB, userID, expenseID int64, amount float64) error {
+	res, err := db.Exec(`UPDATE expenses SET amount = $1 WHERE id = $2 AND user_id = $3`, amount, expenseID, userID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return errors.New("expense not found")
+	}
+	return nil
+}
+
 func buildStats(db *sql.DB, userID int64, period string) (string, error) {
 	now := time.Now()
 	var from time.Time
@@ -383,10 +476,41 @@ func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64, text string) {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🗂 Добавить категорию", "menu_cat"),
 		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🧾 Последний расход", "menu_last"),
+		),
 	)
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyMarkup = kb
 	_, _ = bot.Send(msg)
+}
+
+func sendLastExpenseKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID int64) error {
+	id, category, amount, createdAt, err := getLastExpense(db, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			sendMainMenu(bot, chatID, "У тебя пока нет расходов.")
+			return nil
+		}
+		return err
+	}
+
+	text := fmt.Sprintf("Последний расход:\nКатегория: %s\nСумма: %.2f\nДата: %s", category, amount, createdAt.Format("02.01.2006 15:04"))
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✏️ Изменить сумму", fmt.Sprintf("last_edit:%d", id)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", fmt.Sprintf("last_delete:%d", id)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⬅️ Назад", "menu_back"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyMarkup = kb
+	_, err = bot.Send(msg)
+	return err
 }
 
 func sendCategoryKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID int64, text string) error {
