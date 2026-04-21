@@ -35,6 +35,7 @@ type userState struct {
 	CategoryID int64
 	ExpenseID  int64
 	Amount     float64
+	Note       string
 }
 
 const (
@@ -42,6 +43,7 @@ const (
 	actionWaitCustomTitle = "wait_custom_title"
 	actionWaitEditAmount  = "wait_edit_amount"
 	actionWaitNote        = "wait_note"
+	actionWaitQuickCat    = "wait_quick_category"
 )
 
 func main() {
@@ -148,6 +150,22 @@ func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState,
 
 	state, ok := states[tgUserID]
 	if !ok {
+		amount, note, parsed := parseQuickExpenseInput(msg.Text)
+		if parsed {
+			if len([]rune(note)) > 120 {
+				sendText(bot, chatID, "Комментарий слишком длинный. До 120 символов.")
+				return
+			}
+			states[tgUserID] = userState{
+				Action: actionWaitQuickCat,
+				Amount: amount,
+				Note:   note,
+			}
+			if err := sendCategoryKeyboard(bot, db, chatID, userID, "Выбери категорию для быстрого расхода:", "quickcat"); err != nil {
+				sendText(bot, chatID, "Не удалось загрузить категории.")
+			}
+			return
+		}
 		sendMainMenu(bot, chatID, "Используй кнопки ниже.")
 		return
 	}
@@ -242,7 +260,7 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 	switch {
 	case data == "menu_add":
 		delete(states, tgUserID)
-		if err := sendCategoryKeyboard(bot, db, chatID, userID, "Выбери категорию для расхода:"); err != nil {
+		if err := sendCategoryKeyboard(bot, db, chatID, userID, "Выбери категорию для расхода:", "pickcat"); err != nil {
 			sendText(bot, chatID, "Не удалось загрузить категории.")
 		}
 	case data == "menu_stats":
@@ -272,6 +290,28 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 		}
 		states[tgUserID] = userState{Action: actionWaitAmount, CategoryID: categoryID}
 		sendText(bot, chatID, "Введи сумму расхода (например, 199.90):")
+	case strings.HasPrefix(data, "quickcat:"):
+		idStr := strings.TrimPrefix(data, "quickcat:")
+		categoryID, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			answerCallback(bot, cq.ID, "Неверная категория")
+			return
+		}
+		state, ok := states[tgUserID]
+		if !ok || state.Action != actionWaitQuickCat {
+			sendText(bot, chatID, "Сначала введи расход в формате: 450 кофе")
+			return
+		}
+		if err := addExpense(db, userID, categoryID, state.Amount, state.Note); err != nil {
+			sendText(bot, chatID, "Не удалось сохранить быстрый расход.")
+			return
+		}
+		delete(states, tgUserID)
+		confirmText := fmt.Sprintf("Сохранено: %.2f\nКатегория выбрана.", state.Amount)
+		if state.Note != "" {
+			confirmText = fmt.Sprintf("Сохранено: %.2f\nКомментарий: %s", state.Amount, state.Note)
+		}
+		sendMainMenu(bot, chatID, confirmText)
 	case strings.HasPrefix(data, "stats:"):
 		period := strings.TrimPrefix(data, "stats:")
 		text, err := buildStats(db, userID, period)
@@ -666,7 +706,7 @@ func sendLastExpenseKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID in
 	return err
 }
 
-func sendCategoryKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID int64, text string) error {
+func sendCategoryKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID int64, text, callbackPrefix string) error {
 	categories, err := categoriesByUser(db, userID)
 	if err != nil {
 		return err
@@ -674,7 +714,7 @@ func sendCategoryKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID int64
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for _, c := range categories {
 		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(c.Name, fmt.Sprintf("pickcat:%d", c.ID)),
+			tgbotapi.NewInlineKeyboardButtonData(c.Name, fmt.Sprintf("%s:%d", callbackPrefix, c.ID)),
 		))
 	}
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
@@ -684,6 +724,27 @@ func sendCategoryKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID int64
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	_, err = bot.Send(msg)
 	return err
+}
+
+func parseQuickExpenseInput(text string) (float64, string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return 0, "", false
+	}
+	parts := strings.Fields(trimmed)
+	if len(parts) < 2 {
+		return 0, "", false
+	}
+	amountText := strings.ReplaceAll(parts[0], ",", ".")
+	amount, err := strconv.ParseFloat(amountText, 64)
+	if err != nil || amount <= 0 {
+		return 0, "", false
+	}
+	note := strings.TrimSpace(strings.Join(parts[1:], " "))
+	if note == "" {
+		return 0, "", false
+	}
+	return amount, note, true
 }
 
 func sendStatsPeriodKeyboard(bot *tgbotapi.BotAPI, chatID int64) {
