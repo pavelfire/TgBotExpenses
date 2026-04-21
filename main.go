@@ -46,6 +46,12 @@ const (
 	actionWaitQuickCat    = "wait_quick_category"
 )
 
+const (
+	proInvoicePayload = "pro_forever_v1"
+	proTitle          = "Pro подписка навсегда"
+	proDescription    = "Откроет Pro-функции в будущем. Доступ бессрочный."
+)
+
 func main() {
 	_ = godotenv.Load()
 
@@ -87,6 +93,9 @@ func main() {
 		if update.CallbackQuery != nil {
 			handleCallback(bot, db, states, update.CallbackQuery)
 		}
+		if update.PreCheckoutQuery != nil {
+			handlePreCheckout(bot, update.PreCheckoutQuery)
+		}
 	}
 }
 
@@ -95,7 +104,9 @@ func runMigrations(db *sql.DB) error {
 CREATE TABLE IF NOT EXISTS users (
     id BIGSERIAL PRIMARY KEY,
     tg_user_id BIGINT UNIQUE NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    pro_active BOOLEAN NOT NULL DEFAULT FALSE,
+    pro_activated_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS categories (
@@ -116,7 +127,13 @@ CREATE TABLE IF NOT EXISTS expenses (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 `
-	_, err := db.Exec(query)
+	if _, err := db.Exec(query); err != nil {
+		return err
+	}
+	_, err := db.Exec(`
+ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_active BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS pro_activated_at TIMESTAMPTZ;
+`)
 	return err
 }
 
@@ -138,14 +155,25 @@ func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState,
 		switch msg.Command() {
 		case "start":
 			delete(states, tgUserID)
-			sendMainMenu(bot, chatID, "Привет! Это простой бот учета расходов. Все действия через кнопки ниже.")
+			sendMainMenuForUser(bot, db, chatID, userID, "Привет! Это простой бот учета расходов. Все действия через кнопки ниже.")
 		case "menu":
 			delete(states, tgUserID)
-			sendMainMenu(bot, chatID, "Главное меню")
+			sendMainMenuForUser(bot, db, chatID, userID, "Главное меню")
 		default:
 			sendText(bot, chatID, "Доступные команды: /start, /menu")
 		}
 		return
+	}
+
+	if msg.SuccessfulPayment != nil {
+		if msg.SuccessfulPayment.InvoicePayload == proInvoicePayload {
+			if err := activatePro(db, userID); err != nil {
+				sendText(bot, chatID, "Оплата прошла, но не удалось обновить подписку. Напиши /menu и попробуй снова.")
+				return
+			}
+			sendMainMenuForUser(bot, db, chatID, userID, "Оплата успешна. Pro подписка активирована навсегда.")
+			return
+		}
 	}
 
 	state, ok := states[tgUserID]
@@ -166,7 +194,7 @@ func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState,
 			}
 			return
 		}
-		sendMainMenu(bot, chatID, "Используй кнопки ниже.")
+		sendMainMenuForUser(bot, db, chatID, userID, "Используй кнопки ниже.")
 		return
 	}
 
@@ -190,7 +218,7 @@ func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState,
 			return
 		}
 		delete(states, tgUserID)
-		sendMainMenu(bot, chatID, fmt.Sprintf("Категория \"%s\" добавлена.", name))
+		sendMainMenuForUser(bot, db, chatID, userID, fmt.Sprintf("Категория \"%s\" добавлена.", name))
 	case actionWaitAmount:
 		amountText := strings.ReplaceAll(strings.TrimSpace(msg.Text), ",", ".")
 		amount, err := strconv.ParseFloat(amountText, 64)
@@ -219,10 +247,10 @@ func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState,
 		}
 		delete(states, tgUserID)
 		if note == "" {
-			sendMainMenu(bot, chatID, fmt.Sprintf("Сохранено: %.2f", state.Amount))
+			sendMainMenuForUser(bot, db, chatID, userID, fmt.Sprintf("Сохранено: %.2f", state.Amount))
 			return
 		}
-		sendMainMenu(bot, chatID, fmt.Sprintf("Сохранено: %.2f\nКомментарий: %s", state.Amount, note))
+		sendMainMenuForUser(bot, db, chatID, userID, fmt.Sprintf("Сохранено: %.2f\nКомментарий: %s", state.Amount, note))
 	case actionWaitEditAmount:
 		amountText := strings.ReplaceAll(strings.TrimSpace(msg.Text), ",", ".")
 		amount, err := strconv.ParseFloat(amountText, 64)
@@ -235,10 +263,10 @@ func handleMessage(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState,
 			return
 		}
 		delete(states, tgUserID)
-		sendMainMenu(bot, chatID, fmt.Sprintf("Последний расход обновлен: %.2f", amount))
+		sendMainMenuForUser(bot, db, chatID, userID, fmt.Sprintf("Последний расход обновлен: %.2f", amount))
 	default:
 		delete(states, tgUserID)
-		sendMainMenu(bot, chatID, "Состояние сброшено. Выбери действие.")
+		sendMainMenuForUser(bot, db, chatID, userID, "Состояние сброшено. Выбери действие.")
 	}
 }
 
@@ -278,9 +306,14 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 		if err := sendLastExpenseKeyboard(bot, db, chatID, userID); err != nil {
 			sendText(bot, chatID, "Не удалось загрузить последний расход.")
 		}
+	case data == "menu_sub":
+		delete(states, tgUserID)
+		if err := sendProInvoice(bot, chatID); err != nil {
+			sendText(bot, chatID, "Не удалось отправить инвойс. Попробуй еще раз.")
+		}
 	case data == "menu_back":
 		delete(states, tgUserID)
-		sendMainMenu(bot, chatID, "Главное меню")
+		sendMainMenuForUser(bot, db, chatID, userID, "Главное меню")
 	case strings.HasPrefix(data, "pickcat:"):
 		idStr := strings.TrimPrefix(data, "pickcat:")
 		categoryID, err := strconv.ParseInt(idStr, 10, 64)
@@ -311,7 +344,7 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 		if state.Note != "" {
 			confirmText = fmt.Sprintf("Сохранено: %.2f\nКомментарий: %s", state.Amount, state.Note)
 		}
-		sendMainMenu(bot, chatID, confirmText)
+		sendMainMenuForUser(bot, db, chatID, userID, confirmText)
 	case strings.HasPrefix(data, "stats:"):
 		period := strings.TrimPrefix(data, "stats:")
 		text, err := buildStats(db, userID, period)
@@ -319,7 +352,7 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 			sendText(bot, chatID, "Не удалось получить статистику.")
 			return
 		}
-		sendStatsResultWithDetailsKeyboard(bot, chatID, text, period)
+		sendStatsResultWithDetailsKeyboard(bot, db, chatID, userID, text, period)
 	case strings.HasPrefix(data, "statsdetails:"):
 		period := strings.TrimPrefix(data, "statsdetails:")
 		sendStatsDepthKeyboard(bot, chatID, period)
@@ -342,7 +375,7 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 			sendText(bot, chatID, "Не удалось получить развернутую статистику.")
 			return
 		}
-		sendMainMenu(bot, chatID, text)
+		sendMainMenuForUser(bot, db, chatID, userID, text)
 	case strings.HasPrefix(data, "export:"):
 		period := strings.TrimPrefix(data, "export:")
 		filename, content, err := buildCSVReport(db, userID, period)
@@ -354,7 +387,7 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 			sendText(bot, chatID, "Не удалось отправить CSV файл.")
 			return
 		}
-		sendMainMenu(bot, chatID, "CSV отчет отправлен.")
+		sendMainMenuForUser(bot, db, chatID, userID, "CSV отчет отправлен.")
 	case strings.HasPrefix(data, "last_delete:"):
 		idStr := strings.TrimPrefix(data, "last_delete:")
 		expenseID, err := strconv.ParseInt(idStr, 10, 64)
@@ -367,7 +400,7 @@ func handleCallback(bot *tgbotapi.BotAPI, db *sql.DB, states map[int64]userState
 			return
 		}
 		delete(states, tgUserID)
-		sendMainMenu(bot, chatID, "Последний расход удален.")
+		sendMainMenuForUser(bot, db, chatID, userID, "Последний расход удален.")
 	case strings.HasPrefix(data, "last_edit:"):
 		idStr := strings.TrimPrefix(data, "last_edit:")
 		expenseID, err := strconv.ParseInt(idStr, 10, 64)
@@ -393,6 +426,17 @@ ON CONFLICT (tg_user_id) DO UPDATE SET tg_user_id = EXCLUDED.tg_user_id
 RETURNING id
 `, tgUserID).Scan(&id)
 	return id, err
+}
+
+func userHasPro(db *sql.DB, userID int64) (bool, error) {
+	var hasPro bool
+	err := db.QueryRow(`SELECT pro_active FROM users WHERE id = $1`, userID).Scan(&hasPro)
+	return hasPro, err
+}
+
+func activatePro(db *sql.DB, userID int64) error {
+	_, err := db.Exec(`UPDATE users SET pro_active = TRUE, pro_activated_at = NOW() WHERE id = $1`, userID)
+	return err
 }
 
 func ensureDefaultCategories(db *sql.DB, userID int64) error {
@@ -726,8 +770,8 @@ ORDER BY e.created_at DESC, e.id DESC
 	return filename, buf.Bytes(), nil
 }
 
-func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64, text string) {
-	kb := tgbotapi.NewInlineKeyboardMarkup(
+func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64, text string, showSubscriptionButton bool) {
+	rows := [][]tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("➕ Добавить расход", "menu_add"),
 		),
@@ -743,10 +787,25 @@ func sendMainMenu(bot *tgbotapi.BotAPI, chatID int64, text string) {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("📤 Экспорт CSV", "menu_export"),
 		),
-	)
+	}
+	if showSubscriptionButton {
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⭐ Купить Pro навсегда", "menu_sub"),
+		))
+	}
+	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyMarkup = kb
 	_, _ = bot.Send(msg)
+}
+
+func sendMainMenuForUser(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID int64, text string) {
+	hasPro, err := userHasPro(db, userID)
+	if err != nil {
+		sendMainMenu(bot, chatID, text, true)
+		return
+	}
+	sendMainMenu(bot, chatID, text, !hasPro)
 }
 
 func sendExportPeriodKeyboard(bot *tgbotapi.BotAPI, chatID int64) {
@@ -771,7 +830,7 @@ func sendLastExpenseKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID in
 	id, category, amount, note, createdAt, err := getLastExpense(db, userID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			sendMainMenu(bot, chatID, "У тебя пока нет расходов.")
+			sendMainMenuForUser(bot, db, chatID, userID, "У тебя пока нет расходов.")
 			return nil
 		}
 		return err
@@ -858,7 +917,11 @@ func sendStatsPeriodKeyboard(bot *tgbotapi.BotAPI, chatID int64) {
 	_, _ = bot.Send(msg)
 }
 
-func sendStatsResultWithDetailsKeyboard(bot *tgbotapi.BotAPI, chatID int64, text, period string) {
+func sendStatsResultWithDetailsKeyboard(bot *tgbotapi.BotAPI, db *sql.DB, chatID, userID int64, text, period string) {
+	hasPro, err := userHasPro(db, userID)
+	if err == nil && !hasPro {
+		text += "\n\nДоступен Pro навсегда за 1⭐."
+	}
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔎 Развернутая с комментариями", fmt.Sprintf("statsdetails:%s", period)),
@@ -900,6 +963,27 @@ func sendCSVDocument(bot *tgbotapi.BotAPI, chatID int64, filename string, conten
 	})
 	_, err := bot.Send(doc)
 	return err
+}
+
+func sendProInvoice(bot *tgbotapi.BotAPI, chatID int64) error {
+	prices := []tgbotapi.LabeledPrice{
+		{Label: "Pro навсегда", Amount: 1},
+	}
+	msg := tgbotapi.NewInvoice(chatID, proTitle, proDescription, proInvoicePayload, "", "pro-forever", "XTR", prices)
+	_, err := bot.Send(msg)
+	return err
+}
+
+func handlePreCheckout(bot *tgbotapi.BotAPI, q *tgbotapi.PreCheckoutQuery) {
+	ok := q.InvoicePayload == proInvoicePayload
+	answer := tgbotapi.PreCheckoutConfig{
+		PreCheckoutQueryID: q.ID,
+		OK:                 ok,
+	}
+	if !ok {
+		answer.ErrorMessage = "Неверный payload оплаты."
+	}
+	_, _ = bot.Request(answer)
 }
 
 func answerCallback(bot *tgbotapi.BotAPI, callbackID, text string) {
