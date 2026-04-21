@@ -6,3 +6,78 @@
     без лишнего Enterprises говна потому что этим ботом буду пользоваться только я и пара моих знакомых 
     то есть он должен быть максимально простым легковесным запускаться просто через
      файл на моем железе сейчас вот для анализа расходов
+
+
+
+     Проверь по шагам на сервере:
+
+Статус контейнеров
+cd /opt/tg-expenses-bot
+docker compose ps
+Что должно быть:
+
+db — Up / healthy
+bot — Up
+Логи бота (самое важное)
+docker compose logs -f bot
+Ищи строку вида:
+
+Bot started as @...
+Если есть постоянные рестарты или ошибки подключения к БД — увидишь здесь сразу.
+
+Логи базы
+docker compose logs --tail=100 db
+Ищи, что Postgres принял подключения и нет FATAL ошибок.
+
+Проверка health у Postgres (внутри контейнера)
+docker compose exec db pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+Ожидаемо: accepting connections.
+
+Проверка “бот реально отвечает”
+Открой Telegram и отправь боту /start.
+Должно прийти меню с inline-кнопками.
+Нажми ➕ Добавить расход — если кнопки/ответы приходят, значит polling работает.
+Если что-то не так, самые частые команды для диагностики:
+
+docker compose ps
+docker compose logs --tail=200 bot
+docker compose logs --tail=200 db
+docker compose restart bot
+Если хочешь, могу помочь расшифровать твой вывод docker compose ps и logs (скинь сюда текст).
+
+
+Причина ясна из логов: бот не может зайти в Postgres из-за неверного пароля для tg_user.
+
+pq: password authentication failed for user "tg_user" = пароль в DATABASE_URL (или в env compose) не совпадает с паролем пользователя в самой БД.
+
+Что проверить и исправить:
+
+Посмотреть, что сейчас в env проекта на сервере
+(без вывода токена в чат)
+cd /opt/tg-expenses-bot
+grep -E "POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD|BOT_TOKEN" .env
+Проверить, какие env реально применились в compose
+docker compose config | grep -E "POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD|DATABASE_URL"
+Ключевой момент про Postgres в контейнере
+Если том postgres_data уже был создан, смена POSTGRES_PASSWORD в .env не меняет пароль внутри уже инициализированной БД автоматически.
+То есть обычно происходит так:
+
+сначала БД поднялась с паролем A
+потом в .env поставили B
+бот пытается с B, а БД ждёт A → authentication failed.
+Вариант A (сохранить данные, правильно для рабочего случая)
+Выставить в .env тот пароль, с которым БД была создана изначально, затем:
+
+docker compose up -d
+docker compose logs -f bot
+Вариант B (если данных не жалко, проще всего)
+Сбросить БД-том и поднять заново с текущим паролем из .env:
+
+docker compose down -v
+docker compose up -d --build
+Это удалит все расходы/категории в БД.
+
+Если хочешь, можешь скинуть сюда вывод:
+
+docker compose config | grep -E "POSTGRES_USER|POSTGRES_PASSWORD|DATABASE_URL"
+docker compose ps и я точно скажу, какой из вариантов у тебя сейчас правильный.

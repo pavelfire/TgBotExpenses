@@ -10,9 +10,9 @@
 - есть статистика за сегодня, 7 дней и 30 дней.
 
 ## 1) Что нужно
-- Docker + Docker Compose plugin на сервере
 - SSH-доступ к серверу
 - Токен Telegram-бота от [@BotFather](https://t.me/BotFather)
+- Для авто-установки Docker сервер должен быть Debian/Ubuntu
 
 ## 2) One-command deploy через SSH
 На своей локальной машине (в этой папке) выполни:
@@ -23,6 +23,7 @@ chmod +x deploy.sh
 ```
 
 Скрипт:
+- при необходимости устанавливает Docker + Docker Compose plugin на сервере;
 - копирует проект на сервер;
 - создает `.env` из `.env.docker.example`, если его нет;
 - запускает `docker compose up -d --build`.
